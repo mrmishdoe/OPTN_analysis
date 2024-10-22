@@ -1,0 +1,285 @@
+---
+title: "CompetingRiskDTR_analysis"
+author: "Misha Dolmatov"
+date: "2024-09-14"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(pROC)
+library(rms)
+library(parallel)
+#Load script with functions for analysis
+source("Scripts/CompetingRiskAFT.R")
+```
+
+
+```{r data prep}
+#Cleaning data and checking for errors/missingness
+
+
+df01 <- read.csv("Data/cmprsk_2001.csv")
+
+######## Data cleaning ####
+
+# identifying columns with more than 2 but less than 10 categories
+
+      cols1 = mapply(table,df01) # table all the data
+     
+      index = NULL  # set to assign columns are >2 but <10 categories
+      for(i in 1:ncol(df01)){
+        if(length(cols1[[i]])>2 & length(cols1[[i]])<10){
+          index = append(index, i)
+        }
+      }
+      # convert columns with >2 but <10 columns to factor
+      df2 =  df01
+      df2[,index] <- lapply(df2[,index], factor)
+      
+      str(df2[,index]) # check if those columns are needed to be factors
+      
+      df2 = df2 %>%  mutate_at(vars(matches("delta")),as.character) # reconvert delta to numeric
+      
+      df2 = df2 %>% mutate_at(vars(matches("delta")),as.integer)  # reconvert delta to numeric
+      
+      str(df2) # check the data structure
+      
+# missing outcomes or censoring indicator     
+df.complete <- df2[complete.cases(df2[, c("timeto","delta")]),]
+
+
+## Please note that henceforth, we will be working with the "df.complete" dataset
+
+## Now, we will generate proportion of outcomes, censoring and competing event
+## The code below will give you the # censored (delta = 0), # (cause = 1), and # (Cause = 2)
+
+
+df.complete %>%
+  group_by(delta) %>%
+  summarise(n=n())%>%
+  mutate(freq = round((n / sum(n)),4))
+
+
+```
+
+```{r patient selection}
+#Only select columns of interest and drop all rows with missingness (DONORAA, DonorHCV, COLDISCH, RecHCV, RECDM)
+full_data = df.complete %>% select(ctrcode,delta,timeto,DON_TY, donorage,DONORAA, genderd_num, DONCIG, DonorHCV, DONORCVA, COLDISCH, ORGANDIST, tx_enbloc, age_n, gender_num, RECAA, RecHCV, perip_vasc_new, RECDM, immuno_group) %>% drop_na()
+
+#Drop rows with timeto =< 0 and convert categorical variables to factors
+data = full_data %>% filter(timeto > 0) %>% mutate(DON_TY = ifelse(DON_TY == "C", 0, 1))
+
+#Create cause labels (0 for main, 1 for competing event), treatment variable and change delta to censoring indicator, create group for cluster id and make indicator for cause 1
+data = data %>% mutate(epsilon = delta, delta = ifelse(delta == 0, 0, 1), group = as.factor(ctrcode), ind = ifelse(epsilon ==1, 1, 0))
+  
+#Multiply age by 10, get cluster size as a covariate
+data = data %>% mutate(age_n = 10*age_n)
+sizes = data %>% group_by(group) %>% summarise(log_size = log(n())) %>% ungroup()
+data = data %>% left_join(sizes,by = "group")
+
+#Check proportion of censored, competing events
+#Around 68% censored, 15% for each other causes
+data %>%
+  group_by(delta) %>%
+  summarise(n=n())%>%
+  mutate(freq = round((n / sum(n)),4))
+
+#Save to temp folder
+saveRDS(data, file = "Data/Temp/data.rds")
+```
+Only about 4% of patients have donor with hep c. We use the coding 0 = graft failure, 1 = death with functioning graft
+
+```{r model development and checking}
+#load data
+data = readRDS("Data/Temp/data.rds")
+obs_data = data %>% filter(delta == 1)
+
+#cause model
+cause.mod = glm(ind ~ age_n + gender_num + RECAA + RECDM +RecHCV + immuno_group+ DonorHCV + DON_TY + donorage + DONORAA + genderd_num + DONCIG +  DONORCVA + COLDISCH + ORGANDIST + tx_enbloc, family = binomial, data = obs_data)
+
+roc_curve = roc(obs_data$epsilon-1, predict(cause.mod,type = "response"))
+plot(roc_curve)
+auc(roc_curve) 
+
+cens.mod = glm(delta ~ rcs(age_n,5) + gender_num + RECAA + RECDM + RecHCV + DonorHCV + donorage + DONORAA + genderd_num + DONCIG + 
+                 DONORCVA + COLDISCH + ORGANDIST + tx_enbloc, family = binomial, data = data)
+
+roc_curve = roc(data$delta, predict(cens.mod,type = "response"))
+plot(roc_curve)
+auc(roc_curve) 
+
+```
+
+```{r bootstrap}
+data = readRDS("Data/Temp/data.rds")
+
+#Add blip estimates and oracle regime to data
+
+
+treat.mod = DonorHCV ~ age_n + gender_num + RECAA + RECDM + RecHCV + immuno_group + log_size
+cens.mod = delta~ age_n + gender_num + RECAA + RECDM +RecHCV + immuno_group+ DonorHCV + DON_TY + donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+#After testing, donor age/immunogroup have large model based SEs so not included in tailoring
+out.mod = log(timeto)~ gender_num + RECAA + immuno_group + DonorHCV*RecHCV + DonorHCV*DON_TY + DonorHCV*age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+#Model for probability of failing from cause 1
+cause.mod = ind~ age_n + gender_num + RECAA + RECDM +RecHCV + immuno_group+ DonorHCV + DON_TY + donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+models = list(treat.mod = treat.mod, cens.mod = cens.mod, out.mod = out.mod,cause.mod  =cause.mod)
+
+
+set.seed(2024)
+
+start = Sys.time()
+boot.results = AFT.boot(500, data, models, save = T, file = "bootstrap500")
+end = Sys.time()
+
+#summary
+final.results = summaryAFT(data, boot.results)
+saveRDS(final.results, file = "Results/summary.rds")
+```
+
+```{r saving and loading}
+
+#Need to combine different result objects into one
+boot.est = list()
+names = c("60", "200", "400", "440", "500")
+for(name in names){
+  boot.est = c(boot.est, readRDS(paste0("Results/bootstrap", name, ".rds"))$boot.est)
+  gc()
+}
+saveRDS(boot.est, "Results/boot_est.rds")
+```
+
+```{r summary}
+est = readRDS("Results/est.rds")
+data = readRDS("Data/Temp/data.rds")
+summary_boot = summaryAFT(data, list(est = est, boot.est = boot.est))
+saveRDS(summary_boot, "Results/summary.rds")
+```
+
+
+```{r plotting}
+
+summary_boot = readRDS("Results/summary.rds")
+dat_w = summary_boot$data_w
+dat_g = summary_boot$data_g
+
+plots_w = plotAFT(dat_w, "(a) Weighted regime")
+
+ggsave("Plots/plot_test.jpg", plots_w$p3)
+
+plots_g = plotAFT(dat_g, "(a) Greedy regime")
+
+ggsave("Plots/plot_g.jpg", plots_g$p3)
+
+cause_plot=ggarrange(plots_w$p1, plots_g$p1 ,plots_w$p2, plots_g$p2, ncol = 2, nrow = 2, common.legend = T, legend = "right")
+
+overall_plot = ggarrange(plots_w$p3, plots_g$p3, ncol = 2, nrow = 1, common.legend = T, legend = "right")
+
+ggsave("Plots/cause_plot.jpg", cause_plot, width = 12, height = 12)
+ggsave("plot_overall.jpg", overall_plot, width = 15, height = 10)
+
+
+```
+
+
+```{r table1}
+library(table1)
+library(smd)
+#Table 1 for patient characteristics
+
+mysmd <- function(x, ...) {
+  
+  # Construct vectors of data y, and groups (strata) g
+  
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  
+  max(abs(round(smd(y, g, na.rm = TRUE)[2], 3)))
+  
+}
+
+
+#Cleaning up table for table1
+data.t1 = data %>% mutate(gender_num = factor(gender_num, levels = c(0,1), labels = c("Female", "Male")), 
+                          genderd_num = factor(genderd_num, levels = c(0,1), labels = c("Female", "Male")),
+                          RECAA = factor(RECAA, levels = c(0,1), labels = c("non-African American", "African American")),
+                          DONORAA = factor(DONORAA, levels = c(0,1), labels = c("non-African American", "African American")),
+                          RecHCV = factor(RecHCV, levels = c(0,1), labels = c("HCV-", "HCV+")),
+                          DonorHCV = factor(DonorHCV, levels = c(0,1), labels = c("HCV-", "HCV+")),
+                          donorage = factor(donorage, levels = c(1,3,2), labels = c("0-18", "19-49", "> 49")),
+                          DON_TY = factor(DON_TY, levels = c(0,1), labels = c("Deceased", "Living")),
+                          DONCIG = factor(DONCIG, levels = c(0,1), labels = c("No", "Yes")),
+                          DONORCVA = factor(DONORCVA, levels = c(0,1), labels = c("No", "Yes")),
+                          ORGANDIST = factor(ORGANDIST, levels = c(1,2,3,4), labels = c("Local", "Regional", "National", "Foreign")),
+                          immuno_group = factor(immuno_group, levels = c(1,2,3,4)),
+                          age_n = age_n/10
+                          )
+
+label(data.t1$gender_num) = "Recipient Gender"
+label(data.t1$RECAA) = "Recipient Ethnicity"
+label(data.t1$immuno_group) = "Immuno-group"
+label(data.t1$RecHCV) = "Recipient HCV Status"
+label(data.t1$DonorHCV) = "Donor HCV Status"
+label(data.t1$DON_TY) = "Donor Type"
+label(data.t1$age_n) = "Recipient Age"
+label(data.t1$donorage) = "Donor Age"
+label(data.t1$DONORAA) = "Donor Ethnicity"
+label(data.t1$genderd_num) = "Donor Gender"
+label(data.t1$DONCIG) = "Donor History of Cigarette Use"
+label(data.t1$DONORCVA) = "Donor Cerebrovascular/Stroke"
+label(data.t1$COLDISCH) = "Kidney Cold Ischemic Time"
+label(data.t1$ORGANDIST) = "Organ Allocation Type"
+label(data.t1$log_size) = "Log of Center Size"
+
+#Patient characteristics stratified by Donor HCV status
+tab1 = table1(~gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| DonorHCV, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
+tab1
+
+#Can also do table 1 for patients who got their opt treatment vs not
+#Add opt treatment and indicator variable
+
+treat_w = dat_w %>% mutate(opt = as.numeric(blip > 0), is_opt = as.numeric(DonorHCV == opt)) %>% select(is_opt) %>% unlist()
+data.t1 = data.t1 %>% mutate(is_opt_w = factor(treat_w, levels = c(0,1), labels = c("No", "Yes")))
+
+tab2 = table1(~DonorHCV + gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| is_opt_w, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
+tab2
+
+#Could do the same for greedy regime
+treat_g = dat_g %>% mutate(opt = as.numeric(blip > 0), is_opt = as.numeric(DonorHCV == opt)) %>% select(is_opt) %>% unlist()
+data.t1 = data.t1 %>% mutate(is_opt_g = factor(treat_g, levels = c(0,1), labels = c("No", "Yes")))
+
+tab3 = table1(~DonorHCV + gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| is_opt_g, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
+tab3
+
+#Average survival time for those who received opt vs not
+data.t1 %>% group_by(is_opt_w) %>% filter(delta==1) %>% summarise(m = mean(timeto))
+data.t1 %>% group_by(is_opt_g) %>% filter(delta==1) %>% summarise(m = mean(timeto))
+
+#Median
+data.t1 %>% group_by(is_opt_w) %>% filter(delta==1) %>% summarise(m = median(timeto))
+data.t1 %>% group_by(is_opt_g) %>% filter(delta==1) %>% summarise(m = median(timeto))
+```
+
+
+```{r diagnostics}
+#Residual analysis
+
+#Model 1
+m1 = readRDS("Results/res1.RDS")$mod
+data = readRDS("Data/Temp/data.rds")
+dat1 = data %>% filter(delta ==1 , epsilon == 1)
+r1 = fitted(m1) - log(dat1 %>% select(timeto) %>% unlist() %>% as.numeric())
+hist(r1)
+summary(r1)
+
+#Model 2
+m2 = readRDS("Results/res2.RDS")$mod
+dat2 = data %>% filter(delta ==1 , epsilon == 2)
+r2 = fitted(m2) - log(dat2 %>% select(timeto) %>% unlist() %>% as.numeric())
+hist(r2)
+summary(r2)
+```
+
