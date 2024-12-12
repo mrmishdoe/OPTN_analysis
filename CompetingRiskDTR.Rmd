@@ -168,11 +168,11 @@ dat_g = summary_boot$data_g
 
 plots_w = plotAFT(dat_w, "(a) Weighted regime")
 
-ggsave("Plots/plot_test.jpg", plots_w$p3)
+#ggsave("Plots/plot_test.jpg", plots_w$p3)
 
 plots_g = plotAFT(dat_g, "(a) Greedy regime")
 
-ggsave("Plots/plot_g.jpg", plots_g$p3)
+#ggsave("Plots/plot_g.jpg", plots_g$p3)
 
 cause_plot=ggarrange(plots_w$p1, plots_g$p1 ,plots_w$p2, plots_g$p2, ncol = 2, nrow = 2, common.legend = T, legend = "right")
 
@@ -182,6 +182,40 @@ ggsave("Plots/cause_plot.jpg", cause_plot, width = 12, height = 12)
 ggsave("plot_overall.jpg", overall_plot, width = 15, height = 10)
 
 
+```
+
+```{r cens_and_comp}
+#Censored and composite outcome
+
+data = readRDS("Data/Temp/data.rds")
+
+#Add blip estimates and oracle regime to data
+
+
+treat.mod = DonorHCV ~ age_n + gender_num + RECAA + RECDM + RecHCV + immuno_group + log_size
+cens.mod = delta~ age_n + gender_num + RECAA + RECDM +RecHCV + immuno_group+ DonorHCV + DON_TY + donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+#After testing, donor age/immunogroup have large model based SEs so not included in tailoring
+out.mod = log(timeto)~ gender_num + RECAA + immuno_group + DonorHCV*RecHCV + DonorHCV*DON_TY + DonorHCV*age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+#Model for probability of failing from cause 1
+cause.mod = ind~ age_n + gender_num + RECAA + RECDM +RecHCV + immuno_group+ DonorHCV + DON_TY + donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+models = list(treat.mod = treat.mod, cens.mod = cens.mod, out.mod = out.mod,cause.mod  =cause.mod)
+
+
+#Censored
+set.seed(2024)
+
+start = Sys.time()
+boot.results = AFT.boot(200, data, models, save = T, file = "bootstrap200", regime = "censor")
+end = Sys.time()
+```
+
+```{r}
+#Summary
+
+summary_boot_cens = summaryAFT(data, boot.results)
 ```
 
 
@@ -215,7 +249,9 @@ data.t1 = data %>% mutate(gender_num = factor(gender_num, levels = c(0,1), label
                           DONORCVA = factor(DONORCVA, levels = c(0,1), labels = c("No", "Yes")),
                           ORGANDIST = factor(ORGANDIST, levels = c(1,2,3,4), labels = c("Local", "Regional", "National", "Foreign")),
                           immuno_group = factor(immuno_group, levels = c(1,2,3,4)),
-                          age_n = age_n/10
+                          age_n = age_n/10,
+                          delta = factor(delta, levels = c(0,1), labels = c("Censored", "Observed")),
+                          epsilon = factor(epsilon, levels = c(0,1,2), labels = c("Missing", "Graft failure", "Death with functioning graft"))
                           )
 
 label(data.t1$gender_num) = "Recipient Gender"
@@ -233,10 +269,21 @@ label(data.t1$DONORCVA) = "Donor Cerebrovascular/Stroke"
 label(data.t1$COLDISCH) = "Kidney Cold Ischemic Time"
 label(data.t1$ORGANDIST) = "Organ Allocation Type"
 label(data.t1$log_size) = "Log of Center Size"
+label(data.t1$delta) = "Event Indicator"
+label(data.t1$epsilon) = "Event Type"
+label(data.t1$timeto) = "Survival Time"
+
+#Need to add units
 
 #Patient characteristics stratified by Donor HCV status
-tab1 = table1(~gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| DonorHCV, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
+tab1 = table1(~gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size + timeto + epsilon + delta| DonorHCV, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
 tab1
+
+#Export
+library(xtable)
+
+export= xtable(as.data.frame(tab1))
+print(export, type = "latex", include.rownames = F)
 
 #Can also do table 1 for patients who got their opt treatment vs not
 #Add opt treatment and indicator variable
@@ -244,25 +291,56 @@ tab1
 treat_w = dat_w %>% mutate(opt = as.numeric(blip > 0), is_opt = as.numeric(DonorHCV == opt)) %>% select(is_opt) %>% unlist()
 data.t1 = data.t1 %>% mutate(is_opt_w = factor(treat_w, levels = c(0,1), labels = c("No", "Yes")))
 
-tab2 = table1(~DonorHCV + gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| is_opt_w, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
+tab2 = table1(~DonorHCV + gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| is_opt_w, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd), overall = F)
 tab2
+
+
+print(xtable(as.data.frame(tab2)), type = "latex", include.rownames = F)
 
 #Could do the same for greedy regime
 treat_g = dat_g %>% mutate(opt = as.numeric(blip > 0), is_opt = as.numeric(DonorHCV == opt)) %>% select(is_opt) %>% unlist()
 data.t1 = data.t1 %>% mutate(is_opt_g = factor(treat_g, levels = c(0,1), labels = c("No", "Yes")))
 
-tab3 = table1(~DonorHCV + gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| is_opt_g, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd))
+tab3 = table1(~DonorHCV + gender_num + RECAA + immuno_group + RecHCV + DON_TY + age_n+  donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size| is_opt_g, data = data.t1, render.continuous=c(.="Mean (SD)"),  extra.col = list(`SMD`= mysmd), overall = F)
 tab3
 
-#Average survival time for those who received opt vs not
-data.t1 %>% group_by(is_opt_w) %>% filter(delta==1) %>% summarise(m = mean(timeto))
-data.t1 %>% group_by(is_opt_g) %>% filter(delta==1) %>% summarise(m = mean(timeto))
 
-#Median
-data.t1 %>% group_by(is_opt_w) %>% filter(delta==1) %>% summarise(m = median(timeto))
-data.t1 %>% group_by(is_opt_g) %>% filter(delta==1) %>% summarise(m = median(timeto))
+print(xtable(as.data.frame(tab3)), type = "latex", include.rownames = F)
 ```
 
+```{r metrics}
+data = readRDS("Data/Temp/data.rds")
+
+#Get point estimates for POT and value according to estimators
+#Need censoring model from above
+cens.mod = delta~ age_n + gender_num + RECAA + RECDM +RecHCV + immuno_group+ DonorHCV + DON_TY + donorage + DONORAA + genderd_num + DONCIG + DONORCVA + COLDISCH + ORGANDIST + log_size
+
+cens_mod = glm(cens.mod, data = data, family = binomial)
+
+w = 1/predict(cens_mod, newdata = data %>% filter(delta == 1), type = "response")
+#Need to form outcomes for POT and value estimators
+#Weighted
+dat_w = dat_w %>% mutate(opt = as.numeric(blip > 0), oracle_opt = as.numeric(oracle > 0), pot = as.numeric(opt == oracle_opt),
+                         val = log(timeto) + (opt - DonorHCV)*oracle)
+
+POT_w = lm(pot~1,data = dat_w %>% filter(delta == 1), weights = w)
+val_w = lm(val~1,data = dat_w %>% filter(delta == 1), weights = w)
+
+#Greedy
+dat_g = dat_g %>% mutate(opt = as.numeric(blip > 0), oracle_opt = as.numeric(oracle > 0), pot = as.numeric(opt == oracle_opt),
+                         val = log(timeto) + (opt - DonorHCV)*oracle)
+
+POT_g = lm(pot~1,data = dat_g %>% filter(delta == 1), weights = w)
+val_g = lm(val~1,data = dat_g %>% filter(delta == 1), weights = w)
+
+
+data %>% filter(delta ==1) %>% summarise(m= mean(log(timeto)))
+
+
+#Now want to have table1 for those that are agnostic to donor HCV for both weighted and greedy regimes
+
+
+```
 
 ```{r diagnostics}
 #Residual analysis
